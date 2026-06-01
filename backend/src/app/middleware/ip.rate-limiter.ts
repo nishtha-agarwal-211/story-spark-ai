@@ -1,87 +1,105 @@
 import { Request, Response, NextFunction } from "express";
 import ApiError from "../../errors/api_error";
 import httpStatus from "http-status";
+import { consumeRateLimit } from "./rate_limit.store";
 
-interface RateRecord {
-  count: number;
-  firstRequestAt: number;
-  blockedUntil?: number;
+interface RateLimiterOptions {
+  /** Time window in milliseconds */
+  windowMs: number;
+  /** Maximum requests allowed within the window */
+  maxRequests: number;
+  /** Duration to block the IP in milliseconds once limit is exceeded */
+  blockTimeMs: number;
+  /** Unique key prefix to isolate this limiter's store entries (e.g. "login", "register") */
+  keyPrefix: string;
+  /** Human-readable label used in error messages (e.g. "login", "password reset") */
+  actionLabel?: string;
+  /** Optional custom message builder for the 429 response */
+  buildMessage?: (retryAfterSec: number) => string;
 }
 
-const store = new Map<string, RateRecord>();
+/**
+ * Factory that builds a rate-limiting middleware backed by the shared MongoDB
+ * store, so limits hold across all serverless instances and cold starts.
+ * Each prefix tracks its endpoint independently.
+ */
+export const createRateLimiter = (options: RateLimiterOptions) => {
+  const { windowMs, maxRequests, blockTimeMs, keyPrefix, actionLabel = "request", buildMessage } = options;
 
-// Configurable limits
-const WINDOW_MS = 60 * 60 * 1000; // 1 hour window
-const MAX_REQUESTS = 5; // max registrations per WINDOW_MS
-const BLOCK_TIME_MS = 24 * 60 * 60 * 1000; // block 24 hours when exceeded
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const ip = req.ip;
+      if (!ip) {
+        throw new ApiError(httpStatus.FORBIDDEN, "Could not determine client IP address.");
+      }
 
-// Cleanup old keys periodically to prevent memory leak
-const cleanupInterval = setInterval(() => {
-  const now = Date.now();
-  for (const [key, rec] of store.entries()) {
-    const age = now - rec.firstRequestAt;
-    if ((rec.blockedUntil && rec.blockedUntil < now) || age > WINDOW_MS + BLOCK_TIME_MS) {
-      store.delete(key);
-    }
-  }
-}, 60 * 60 * 1000); // every hour
-cleanupInterval.unref(); // Allow Node process to exit cleanly
+      const { allowed, retryAfterSec } = await consumeRateLimit({
+        key: `${keyPrefix}_${ip}`,
+        windowMs,
+        maxRequests,
+        blockTimeMs,
+      });
 
-export const ipRateLimiter = (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const ip = req.ip;
-    
-    if (!ip) {
-      throw new ApiError(httpStatus.FORBIDDEN, "Could not determine client IP address.");
-    }
-    
-    const now = Date.now();
-    const key = `reg_${ip}`;
+      if (!allowed) {
+        res.setHeader("Retry-After", String(retryAfterSec));
+        const message = buildMessage
+          ? buildMessage(retryAfterSec)
+          : `Too many ${actionLabel} attempts. Please try again after ${Math.ceil(retryAfterSec / 60)} minutes.`;
+        throw new ApiError(httpStatus.TOO_MANY_REQUESTS, message);
+      }
 
-    let rec = store.get(key);
-    if (!rec) {
-      rec = { count: 1, firstRequestAt: now };
-      store.set(key, rec);
       return next();
+    } catch (error) {
+      next(error);
     }
-
-    // If currently blocked
-    if (rec.blockedUntil && rec.blockedUntil > now) {
-      const retryAfter = Math.ceil((rec.blockedUntil - now) / 1000);
-      res.setHeader("Retry-After", String(retryAfter));
-      throw new ApiError(
-        httpStatus.TOO_MANY_REQUESTS,
-        `Too many registration attempts from this IP. Try again after ${Math.ceil(retryAfter / 60)} minutes.`
-      );
-    }
-
-    // Reset window if elapsed
-    if (now - rec.firstRequestAt > WINDOW_MS) {
-      rec.count = 1;
-      rec.firstRequestAt = now;
-      rec.blockedUntil = undefined;
-      store.set(key, rec);
-      return next();
-    }
-
-    rec.count += 1;
-
-    if (rec.count > MAX_REQUESTS) {
-      rec.blockedUntil = now + BLOCK_TIME_MS;
-      store.set(key, rec);
-      const retryAfter = Math.ceil(BLOCK_TIME_MS / 1000);
-      res.setHeader("Retry-After", String(retryAfter));
-      throw new ApiError(
-        httpStatus.TOO_MANY_REQUESTS,
-        "Too many registration attempts. This IP has been temporarily blocked from registering."
-      );
-    }
-
-    store.set(key, rec);
-    return next();
-  } catch (error) {
-    next(error);
-  }
+  };
 };
+
+// ── Pre-configured rate limiters for authentication endpoints ──
+
+/** Registration: 5 attempts per hour, 24-hour block (original behaviour) */
+export const ipRateLimiter = createRateLimiter({
+  windowMs: 60 * 60 * 1000,        // 1 hour
+  maxRequests: 5,
+  blockTimeMs: 24 * 60 * 60 * 1000, // 24 hours
+  keyPrefix: "reg",
+  actionLabel: "registration",
+});
+
+/** Login: 10 attempts per 15 minutes, 15-minute block */
+export const loginRateLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,  // 15 minutes
+  maxRequests: 10,
+  blockTimeMs: 15 * 60 * 1000, // 15 minutes
+  keyPrefix: "login",
+  actionLabel: "login",
+});
+
+/** Forgot Password: 3 attempts per hour, 1-hour block (prevents email spam) */
+export const forgotPasswordRateLimiter = createRateLimiter({
+  windowMs: 60 * 60 * 1000,  // 1 hour
+  maxRequests: 3,
+  blockTimeMs: 60 * 60 * 1000, // 1 hour
+  keyPrefix: "forgot_pw",
+  actionLabel: "password reset",
+});
+
+/** Reset Password: 5 attempts per hour, 1-hour block */
+export const resetPasswordRateLimiter = createRateLimiter({
+  windowMs: 60 * 60 * 1000,  // 1 hour
+  maxRequests: 5,
+  blockTimeMs: 60 * 60 * 1000, // 1 hour
+  keyPrefix: "reset_pw",
+  actionLabel: "password reset",
+});
+
+/** Payment: 20 attempts per 15 minutes, 15-minute block */
+export const paymentRateLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,  // 15 minutes
+  maxRequests: 20,
+  blockTimeMs: 15 * 60 * 1000, // 15 minutes
+  keyPrefix: "payment",
+  actionLabel: "payment",
+});
 
 export default ipRateLimiter;

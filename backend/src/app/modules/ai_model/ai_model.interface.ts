@@ -3,6 +3,8 @@ export interface IAIModel {
   wordLength: number;
   numStories: number;
   language?: string;
+  tone?: string;
+  genre?: string;
 }
 
 export interface IStory {
@@ -21,6 +23,12 @@ export interface IAlternateEnding {
 
 export type RemixType = "setting" | "perspective" | "time_period" | "tone" | "gender_swap";
 
+export interface ITranslatePayload {
+  title: string;
+  content: string;
+  targetLanguage: string;
+}
+
 export interface IRemixPayload {
   title: string;
   content: string;
@@ -34,8 +42,14 @@ export interface IAlternateEndingPayload {
   title: string;
   content: string;
   tag: string;
-
   language?: string;
-
+}
+export interface IChatMessage {
+  role: "user" | "model";
+  parts: string;
 }
 
+export interface IChatPayload {
+  message: string;
+  history?: IChatMessage[];
+}
